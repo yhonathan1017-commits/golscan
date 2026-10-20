@@ -124,6 +124,10 @@ class UsbKLine(private val usbManager: UsbManager) {
         port?.setParameters(baud, 8, UsbSerialPort.STOPBITS_1, UsbSerialPort.PARITY_NONE)
     }
 
+    fun setBreak(on: Boolean) {
+        port?.setBreak(on)
+    }
+
     fun write(byte: Int) {
         val p = port ?: throw IllegalStateException("Puerto cerrado")
         p.write(byteArrayOf(byte.toByte()), 400)
@@ -219,11 +223,28 @@ class Kwp1281(private val kline: UsbKLine, private val log: (String) -> Unit) {
     }
 
     private fun slowInit(address: Int) {
-        log("Init lento, direccion 0x%02X ...".format(address))
-        kline.setBaud(5)
-        kline.write(address and 0xFF)
-        Thread.sleep(2200)
-        kline.drain(30)
+        log("Init lento 5 baud (bit-bang), dir 0x%02X ...".format(address))
+        val bitMs = 200L
+        val dataBits = IntArray(7) { (address shr it) and 1 }
+        val ones = dataBits.sum()
+        val parity = if (ones % 2 == 0) 1 else 0
+        try {
+            kline.setBreak(false)
+            Thread.sleep(300)
+            kline.setBreak(true)
+            Thread.sleep(bitMs)
+            for (b in dataBits) {
+                kline.setBreak(b == 0)
+                Thread.sleep(bitMs)
+            }
+            kline.setBreak(parity == 0)
+            Thread.sleep(bitMs)
+            kline.setBreak(false)
+            Thread.sleep(bitMs)
+        } catch (e: Exception) {
+            throw IllegalStateException("El cable no soporta break para el init: " + e.message)
+        }
+        kline.drain(40)
     }
 
     fun readFaults(): List<FaultCode> {
