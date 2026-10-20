@@ -341,7 +341,6 @@ class Kwp1281(private val kline: UsbKLine, private val log: (String) -> Unit) {
 
     private fun sendByteRaw(b: Int) {
         kline.write(b)
-        kline.readByte(1200) // descartar eco local
         Thread.sleep(5)
     }
 
