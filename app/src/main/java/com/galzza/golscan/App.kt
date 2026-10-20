@@ -165,7 +165,7 @@ class UsbKLine(private val usbManager: UsbManager) {
 
 class Kwp1281(private val kline: UsbKLine, private val log: (String) -> Unit) {
     private var counter = 0
-    var connected = false
+    @Volatile var connected = false
         private set
 
     private object T {
@@ -179,47 +179,150 @@ class Kwp1281(private val kline: UsbKLine, private val log: (String) -> Unit) {
         const val END_OUTPUT = 0x06
     }
 
+    private class Block(val counter: Int, val title: Int, val data: IntArray)
+
+    // Comunicacion continua (keep-alive): KWP1281 corta la sesion si el tester
+    // no contesta cada bloque en ~1s. Por eso mantenemos un hilo que intercambia
+    // bloques sin parar, y las peticiones se montan sobre ese flujo.
+    @Volatile private var running = false
+    private var commThread: Thread? = null
+    private val lock = Object()
+    private var pendingTitle = -1
+    private var pendingData = ByteArray(0)
+    private var reqState = 0   // 0=idle, 1=pendiente, 2=enviada, 3=lista
+    private val collected = ArrayList<Block>()
+    @Volatile private var fatalError: String? = null
+
     fun connect(address: Int = 0x01): EcuInfo {
-        kline.drain()
-        slowInit(address)
-        kline.setBaud(COMM_BAUD)
-
-        val sync = kline.readByte(2500)
-        log("Sync: 0x%02X".format(sync))
-        require(sync == 0x55) { "No llego 0x55 (llego 0x%02X). Revisa cable/contacto o prueba 9600 baud.".format(sync) }
-
-        val kb1 = kline.readByte(300)
-        val kb2 = kline.readByte(300)
-        require(kb1 >= 0 && kb2 >= 0) { "No llegaron los key bytes." }
-        log("Key bytes: 0x%02X 0x%02X".format(kb1, kb2))
-
-        Thread.sleep(W4_MS.toLong())
-        sendByteRaw(kb2.inv() and 0xFF)
-
-        counter = 1
-        connected = true
-
-        val ids = mutableListOf<String>()
-        while (true) {
-            val block = receiveBlock() ?: break
-            when (block.title) {
-                T.ASCII -> {
-                    val s = String(block.data.map { (it and 0xFF).toByte() }.toByteArray(), Charsets.ISO_8859_1)
-                    ids.add(s.trim())
-                    log("ID: $s")
-                    sendAck()
-                }
-                T.ACK -> break
-                else -> { sendAck() }
+        var lastSync = -1
+        for (attempt in 1..4) {
+            kline.drain()
+            slowInit(address)
+            kline.setBaud(COMM_BAUD)
+            val sync = kline.readByte(2500)
+            lastSync = sync
+            log("Sync: 0x%02X".format(sync))
+            if (sync == 0x55) {
+                val kb1 = kline.readByte(300)
+                val kb2 = kline.readByte(300)
+                require(kb1 >= 0 && kb2 >= 0) { "No llegaron los key bytes." }
+                log("Key bytes: 0x%02X 0x%02X".format(kb1, kb2))
+                Thread.sleep(W4_MS.toLong())
+                sendByteRaw(kb2.inv() and 0xFF)
+                counter = 1
+                connected = true
+                running = true
+                fatalError = null
+                commThread = Thread { commLoop() }.apply { isDaemon = true; start() }
+                return EcuInfo(kb1, kb2, emptyList())
             }
+            log("Reintentando init (intento %d)...".format(attempt))
+            Thread.sleep(400)
         }
-        return EcuInfo(kb1, kb2, ids)
+        throw IllegalStateException("No llego 0x55 (ultimo 0x%02X) tras varios intentos. Revisa contacto o prueba 9600 baud.".format(lastSync))
+    }
+
+    private fun commLoop() {
+        try {
+            while (running) {
+                val block = receiveBlock() ?: throw IllegalStateException("La ECU dejo de responder")
+                synchronized(lock) {
+                    if (reqState == 2) {
+                        if (block.title == T.ACK) {
+                            reqState = 3
+                            lock.notifyAll()
+                        } else {
+                            collected.add(block)
+                        }
+                    } else if (block.title == T.ASCII) {
+                        val s = String(block.data.map { (it and 0xFF).toByte() }.toByteArray(), Charsets.ISO_8859_1)
+                        log("ID: " + s.trim())
+                    }
+                }
+                var toSend = -1
+                var dataToSend = ByteArray(0)
+                synchronized(lock) {
+                    if (reqState == 1) {
+                        toSend = pendingTitle
+                        dataToSend = pendingData
+                        reqState = 2
+                    }
+                }
+                Thread.sleep(W4_MS.toLong())
+                if (toSend != -1) sendBlock(toSend, dataToSend) else sendAck()
+            }
+        } catch (e: Exception) {
+            fatalError = e.message
+            log("Sesion caida: " + e.message)
+            connected = false
+            running = false
+            synchronized(lock) { reqState = 3; lock.notifyAll() }
+        }
+    }
+
+    private fun request(title: Int, data: ByteArray, timeoutMs: Long): List<Block> {
+        check(connected) { "No conectado" }
+        synchronized(lock) {
+            collected.clear()
+            pendingTitle = title
+            pendingData = data
+            reqState = 1
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (reqState != 3 && System.currentTimeMillis() < deadline) {
+                lock.wait(200)
+            }
+            val result = ArrayList(collected)
+            reqState = 0
+            pendingTitle = -1
+            fatalError?.let { throw IllegalStateException(it) }
+            return result
+        }
     }
 
     fun disconnect() {
-        if (!connected) return
-        try { sendBlock(T.END_OUTPUT, byteArrayOf()) } catch (_: Exception) {}
+        running = false
+        try { commThread?.join(1500) } catch (_: Exception) {}
         connected = false
+    }
+
+    fun readFaults(): List<FaultCode> {
+        val blocks = request(T.READ_FAULTS, ByteArray(0), 4000)
+        val faults = ArrayList<FaultCode>()
+        for (block in blocks) {
+            if (block.title != T.FAULTS_RESPONSE) continue
+            var i = 0
+            while (i + 2 < block.data.size) {
+                val hi = block.data[i] and 0xFF
+                val lo = block.data[i + 1] and 0xFF
+                val elab = block.data[i + 2] and 0xFF
+                val code = (hi shl 8) or lo
+                if (code != 0xFFFF && code != 0x0000) faults.add(FaultCode(code, elab, FaultText.describe(code)))
+                i += 3
+            }
+        }
+        return faults
+    }
+
+    fun clearFaults(): Boolean {
+        request(T.CLEAR_FAULTS, ByteArray(0), 4000)
+        return fatalError == null
+    }
+
+    fun readGroup(group: Int): List<Measurement> {
+        val blocks = request(T.READ_GROUP, byteArrayOf((group and 0xFF).toByte()), 4000)
+        val out = ArrayList<Measurement>()
+        for (block in blocks) {
+            if (block.title != T.GROUP_RESPONSE) continue
+            var i = 0
+            while (i + 2 < block.data.size) {
+                val f = block.data[i] and 0xFF
+                val a = block.data[i + 1] and 0xFF
+                val b = block.data[i + 2] and 0xFF
+                out.add(Measurement(f, a, b, Formulas.apply(f, a, b)))
+                i += 3
+            }
+        }
+        return out
     }
 
     private fun slowInit(address: Int) {
@@ -247,65 +350,7 @@ class Kwp1281(private val kline: UsbKLine, private val log: (String) -> Unit) {
         kline.drain(40)
     }
 
-    fun readFaults(): List<FaultCode> {
-        check(connected) { "No conectado" }
-        sendBlock(T.READ_FAULTS, byteArrayOf())
-        val faults = mutableListOf<FaultCode>()
-        while (true) {
-            val block = receiveBlock() ?: break
-            if (block.title == T.FAULTS_RESPONSE) {
-                var i = 0
-                while (i + 2 < block.data.size) {
-                    val hi = block.data[i] and 0xFF
-                    val lo = block.data[i + 1] and 0xFF
-                    val elab = block.data[i + 2] and 0xFF
-                    val code = (hi shl 8) or lo
-                    if (code != 0xFFFF && code != 0x0000) {
-                        faults.add(FaultCode(code, elab, FaultText.describe(code)))
-                    }
-                    i += 3
-                }
-                sendAck()
-            } else if (block.title == T.ACK) {
-                break
-            } else {
-                sendAck()
-                break
-            }
-        }
-        return faults
-    }
-
-    fun clearFaults(): Boolean {
-        check(connected) { "No conectado" }
-        sendBlock(T.CLEAR_FAULTS, byteArrayOf())
-        val block = receiveBlock() ?: return false
-        return block.title == T.ACK
-    }
-
-    fun readGroup(group: Int): List<Measurement> {
-        check(connected) { "No conectado" }
-        sendBlock(T.READ_GROUP, byteArrayOf((group and 0xFF).toByte()))
-        val block = receiveBlock() ?: return emptyList()
-        if (block.title != T.GROUP_RESPONSE) { sendAck(); return emptyList() }
-        val out = mutableListOf<Measurement>()
-        var i = 0
-        while (i + 2 < block.data.size) {
-            val f = block.data[i] and 0xFF
-            val a = block.data[i + 1] and 0xFF
-            val b = block.data[i + 2] and 0xFF
-            out.add(Measurement(f, a, b, Formulas.apply(f, a, b)))
-            i += 3
-        }
-        sendAck()
-        return out
-    }
-
-    // --- nucleo de bloques con handshake ---
-
-    private class Block(val counter: Int, val title: Int, val data: IntArray)
-
-    private fun sendAck() = sendBlock(T.ACK, byteArrayOf())
+    private fun sendAck() = sendBlock(T.ACK, ByteArray(0))
 
     private fun sendBlock(title: Int, data: ByteArray) {
         counter = (counter + 1) and 0xFF
@@ -326,7 +371,6 @@ class Kwp1281(private val kline: UsbKLine, private val log: (String) -> Unit) {
         val data = IntArray(if (dataLen > 0) dataLen else 0)
         for (i in data.indices) data[i] = recvByteHandshaked() ?: return null
         val etx = kline.readByte(1200)
-        kline.readByte(10)
         if (etx != 0x03) log("Aviso: fin de bloque 0x%02X".format(etx))
         return Block(cnt, title, data)
     }
