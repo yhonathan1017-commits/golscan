@@ -226,7 +226,7 @@ class Kwp1281(private val kline: UsbKLine, private val log: (String) -> Unit) {
         try {
             while (running) {
                 val block = receiveBlock() ?: throw IllegalStateException("La ECU dejo de responder")
-                synchronized(lock) {
+                synchronized<Unit>(lock) {
                     if (reqState == 2) {
                         if (block.title == T.ACK) {
                             reqState = 3
@@ -241,7 +241,7 @@ class Kwp1281(private val kline: UsbKLine, private val log: (String) -> Unit) {
                 }
                 var toSend = -1
                 var dataToSend = ByteArray(0)
-                synchronized(lock) {
+                synchronized<Unit>(lock) {
                     if (reqState == 1) {
                         toSend = pendingTitle
                         dataToSend = pendingData
@@ -256,13 +256,13 @@ class Kwp1281(private val kline: UsbKLine, private val log: (String) -> Unit) {
             log("Sesion caida: " + e.message)
             connected = false
             running = false
-            synchronized(lock) { reqState = 3; lock.notifyAll() }
+            synchronized<Unit>(lock) { reqState = 3; lock.notifyAll() }
         }
     }
 
     private fun request(title: Int, data: ByteArray, timeoutMs: Long): List<Block> {
         check(connected) { "No conectado" }
-        synchronized(lock) {
+        synchronized<Unit>(lock) {
             collected.clear()
             pendingTitle = title
             pendingData = data
