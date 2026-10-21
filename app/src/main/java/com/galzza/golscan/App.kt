@@ -209,6 +209,15 @@ class Kwp1281(private val kline: UsbKLine, private val log: (String) -> Unit) {
                 log("Key bytes: 0x%02X 0x%02X".format(kb1, kb2))
                 Thread.sleep(W4_MS.toLong())
                 sendByteRaw(kb2.inv() and 0xFF)
+                run {
+                    val sb = StringBuilder()
+                    val t0 = System.currentTimeMillis()
+                    while (System.currentTimeMillis() - t0 < 1800) {
+                        val x = kline.readByte(150)
+                        if (x >= 0) sb.append("%02X ".format(x))
+                    }
+                    log(if (sb.isNotEmpty()) "RXcrudo: " + sb.toString() else "RXcrudo: (nada)")
+                }
                 counter = 1
                 connected = true
                 running = true
